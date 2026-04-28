@@ -1,0 +1,113 @@
+name: Build, Upload and Register Stack
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  resolve-env:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.resolve.outputs.environment }}
+    steps:
+      - name: Resolve environment from branch
+        id: resolve
+        run: |
+          case "${GITHUB_REF_NAME}" in
+            main) echo "environment=prod" >> "$GITHUB_OUTPUT" ;;
+            test) echo "environment=test" >> "$GITHUB_OUTPUT" ;;
+            *)    echo "environment=dev"  >> "$GITHUB_OUTPUT" ;;
+          esac
+
+  # ── Docker Build (remove this job for static-only stacks) ──────────
+  build:
+    needs: resolve-env
+    runs-on: ubuntu-latest
+    environment: ${{ needs.resolve-env.outputs.environment }}
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Log in to Azure Container Registry
+        run: az acr login --name ${{ vars.ACR_NAME }}
+
+      # TODO: Add your docker build+push steps here.
+      # Example for a single image:
+      #
+      # - name: Build and push Docker image
+      #   run: |
+      #     IMAGE_NAME=$(echo "${{ vars.ACR_NAME }}.azurecr.io/{{DOCKER_IMAGE_NAME}}" | tr '[:upper:]' '[:lower:]')
+      #     docker build -t $IMAGE_NAME .
+      #     docker push $IMAGE_NAME
+      #
+      # For multiple images (e.g., backend + frontend), duplicate the step
+      # with different image names and build contexts.
+
+  # ── Source Upload ───────────────────────────────────────────────────
+  upload:
+    needs: resolve-env
+    runs-on: ubuntu-latest
+    environment: ${{ needs.resolve-env.outputs.environment }}
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Zip source code
+        run: zip -r source_code.zip . -x "node_modules/*" ".git/*" "__pycache__/*"
+
+      - name: Upload to Azure Blob Storage
+        run: |
+          az storage blob upload \
+            --account-name ${{ vars.AZURE_STORAGE_ACCOUNT }} \
+            --container-name ${{ vars.AZURE_STORAGE_CONTAINER }} \
+            --name "{{SOURCE_CODE_LOCATION}}" \
+            --file source_code.zip \
+            --overwrite
+
+  # ── Register Stack in Deploy Box ───────────────────────────────────
+  register-stack:
+    needs: [resolve-env, build, upload]  # Remove 'build' from needs if no Docker job
+    uses: Deploy-Box/deploy-box-platform/.github/workflows/register-stack.yml@dev
+    with:
+      stack_type: "{{STACK_TYPE}}"
+      stack_variant: "BASIC"
+      stack_version: "1.0"
+      stack_name: "{{STACK_NAME}}"
+      description: "{{STACK_DESCRIPTION}}"
+      features: '{{STACK_FEATURES}}'
+      stack_infrastructure: '{{STACK_INFRASTRUCTURE}}'
+      source_code_location: "{{SOURCE_CODE_LOCATION}}"
+      price_id: "{{PRICE_ID}}"
+      environment: ${{ needs.resolve-env.outputs.environment }}
+    secrets:
+      DEPLOYBOX_DB_HOST: ${{ needs.resolve-env.outputs.environment == 'prod' && secrets.PROD_DEPLOYBOX_DB_HOST || needs.resolve-env.outputs.environment == 'test' && secrets.TEST_DEPLOYBOX_DB_HOST || secrets.DEV_DEPLOYBOX_DB_HOST }}
+      DEPLOYBOX_DB_PORT: ${{ needs.resolve-env.outputs.environment == 'prod' && secrets.PROD_DEPLOYBOX_DB_PORT || needs.resolve-env.outputs.environment == 'test' && secrets.TEST_DEPLOYBOX_DB_PORT || secrets.DEV_DEPLOYBOX_DB_PORT }}
+      DEPLOYBOX_DB_NAME: ${{ needs.resolve-env.outputs.environment == 'prod' && secrets.PROD_DEPLOYBOX_DB_NAME || needs.resolve-env.outputs.environment == 'test' && secrets.TEST_DEPLOYBOX_DB_NAME || secrets.DEV_DEPLOYBOX_DB_NAME }}
+      DEPLOYBOX_DB_USER: ${{ needs.resolve-env.outputs.environment == 'prod' && secrets.PROD_DEPLOYBOX_DB_USER || needs.resolve-env.outputs.environment == 'test' && secrets.TEST_DEPLOYBOX_DB_USER || secrets.DEV_DEPLOYBOX_DB_USER }}
+      DEPLOYBOX_DB_PASSWORD: ${{ needs.resolve-env.outputs.environment == 'prod' && secrets.PROD_DEPLOYBOX_DB_PASSWORD || needs.resolve-env.outputs.environment == 'test' && secrets.TEST_DEPLOYBOX_DB_PASSWORD || secrets.DEV_DEPLOYBOX_DB_PASSWORD }}
